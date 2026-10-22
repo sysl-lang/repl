@@ -1,0 +1,90 @@
+module sh.sysl.repl.host
+@tests
+
+import sysl.fs.{make_temp_dir, read_text, remove_dir_all, write_bytes, write_text}
+
+// The host half: the history file, the allocated editor, and what the Unix terminal says when it is
+// not a terminal. Each test that touches the disk has a temporary directory of its own, since the
+// tests run in parallel.
+
+private scratch() -> string = make_temp_dir("repl-test").expect("a temporary directory")
+
+@test("a saved history loads back entry for entry, oldest first")
+history_round_trip()
+    val dir = scratch()
+    val file = dir + "/history"
+    var ed = hosted_editor(64, 1024, 100)
+
+    for s in ["one", "two two", "日本"] do ed.history.add(s)
+
+    save_history(&ed, file).expect("saved")
+    assert_eq(read_text(file).expect("read"), "one\ntwo two\n日本\n")
+
+    var back = hosted_editor(64, 1024, 100)
+
+    assert_eq(load_history(&back, file).expect("loaded"), 3)
+    assert_eq(back.history.get(0), "one")
+    assert_eq(back.history.get(2), "日本")
+    remove_dir_all(dir)
+
+@test("loading skips blank lines and repeats, and keeps only what the limit allows")
+history_load_filters()
+    val dir = scratch()
+    val file = dir + "/history"
+    var ed = hosted_editor(64, 1024, 2)
+
+    write_text(file, "a\n\na\nb\n  \nc\n").expect("written")
+    assert_eq(load_history(&ed, file).expect("loaded"), 3)
+    assert_eq(ed.history.len(), 2)
+    assert_eq(ed.history.get(0), "b")
+    assert_eq(ed.history.get(1), "c")
+    remove_dir_all(dir)
+
+@test("a history file that does not exist is an empty history")
+history_missing_file()
+    val dir = scratch()
+    var ed = hosted_editor(64, 1024, 10)
+
+    assert_eq(load_history(&ed, dir + "/absent").expect("no error"), 0)
+    remove_dir_all(dir)
+
+@test("a history file that cannot be written is an error, not a trap")
+history_unwritable()
+    var ed = hosted_editor(64, 1024, 10)
+
+    ed.history.add("x")
+    assert(save_history(&ed, "/nonexistent-dir-for-repl/history").is_err())
+
+@test("a history file that is not text is an error, not a trap")
+history_not_text()
+    val dir = scratch()
+    val file = dir + "/history"
+    var bad: [2]u8 = [0xff, 10]
+    var ed = hosted_editor(64, 1024, 10)
+
+    write_bytes(file, bad).expect("written")
+    assert(load_history(&ed, file).is_err())
+    remove_dir_all(dir)
+
+@test("a hosted editor has the capacities it was asked for")
+hosted_capacities()
+    val ed = hosted_editor(5, 100, 7)
+
+    assert_eq(ed.line.capacity(), 5)
+    assert_eq(ed.draft.len, 5)
+    assert_eq(ed.history.store.len, 100)
+    assert_eq(ed.history.limit, 7)
+
+@test("the configuration's defaults")
+config_defaults()
+    val c = config("$ ")
+
+    assert_eq(c.prompts.prompt, "$ ")
+    assert_eq(c.prompts.more, ". ")
+    assert_eq(c.prompts.banner, "")
+    assert_eq(c.history_file, "")
+    assert_eq(c.line_cap, 4096)
+
+@test("a home file is under the home directory")
+home_file_under_home()
+    assert(home_file(".x_history").ends_with("/.x_history"))

@@ -1,0 +1,50 @@
+// The same REPL on a board with no heap and no operating system: a UART terminal in a few lines, the
+// storage as module arrays, and the whole program held to `@no_alloc`.
+//
+//     sysl build-c examples/board.sysl --target thumb-freestanding -o board.a
+//
+// The archive exports `repl_main`, and the board supplies `uart_getc` and `uart_putc` -- the receive
+// and transmit registers, waited on. This is the build that checks the core really runs where there is
+// no allocator: anything it reaches that allocated would be refused here.
+@no_alloc
+
+import sh.sysl.repl.{Done, Quit, Terminal, editor, prompts, run}
+
+// What the board answers: the next received byte (waiting for one), or -1 when the line is down.
+extern "uart_getc" uart_getc() -> int
+extern "uart_putc" uart_putc(c: int)
+
+/** A UART: no buffer to flush and no line discipline to switch off. */
+struct Uart
+end Uart
+
+impl Terminal for Uart
+    read_byte(*self) -> Option[u8]
+        val c = uart_getc()
+
+        if c < 0 then None else Some(u8(c))
+
+    write(*self, bytes: []const u8) -> bool
+        for b in bytes do uart_putc(int(b))
+
+        true
+
+    flush(*self) -> bool = true
+    enter_raw_mode(*self) -> bool = true
+    exit_raw_mode(*self) = ()
+
+var line_store: [128]u8 = [0; 128]
+var draft_store: [128]u8 = [0; 128]
+var history_store: [1024]u8 = [0; 1024]
+var join_store: [512]u8 = [0; 512]
+
+@export("repl_main")
+repl_main()
+    var ed = editor(line_store, draft_store, history_store, 16)
+    var uart = Uart()
+
+    run(&ed, &uart, join_store, prompts("pico> "), (line, out) ->
+        if line == "bye" then return Quit
+
+        out.print(line)
+        Done)

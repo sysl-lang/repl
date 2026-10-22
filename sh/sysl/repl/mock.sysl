@@ -1,0 +1,73 @@
+module sh.sysl.repl
+@no_alloc
+
+import sysl.text.str_view
+
+/** A terminal made of a script: the bytes it will be sent, and room for what it is told.
+ *
+ * **Most of this package's tests drive the editor through one**, because what a line editor does is
+ * two things -- the line it answers and the bytes it wrote -- and both are exact here. It is public so
+ * a consumer can test its own REPL the same way, and it allocates nothing, so it runs on a board.
+ *
+ * Writing past the end of `output` is a failed write, as is every write once `writes_left` reaches
+ * zero; `width` is what the terminal claims its width is, 0 for "cannot say".
+ */
+struct MockTerminal
+    input: []const u8
+    read_at: usize
+    output: []u8
+    written: usize
+    width: usize
+    /** How many more writes succeed; `None`, the default, is no limit. */
+    writes_left: Option[usize]
+    raw: bool
+    /** How many times raw mode was entered and left, so a test can see it was put back. */
+    entered: usize
+    exited: usize
+
+    /** Everything written so far, as text. */
+    text(self) -> string = str_view(self.output[0..<self.written])
+
+    /** Forgets what was written. */
+    reset_output(*self)
+        self.written = 0
+end MockTerminal
+
+impl Terminal for MockTerminal
+    read_byte(*self) -> Option[u8]
+        if self.read_at >= self.input.len then return None
+
+        self.read_at += 1
+        Some(self.input[self.read_at - 1])
+
+    write(*self, bytes: []const u8) -> bool
+        if bytes.len > self.output.len - self.written then return false
+
+        self.writes_left match
+            Some(0) -> return false
+            Some(n) -> self.writes_left = Some(n - 1)
+            None -> ()
+
+        for k in 0..<bytes.len do self.output[self.written + k] = bytes[k]
+
+        self.written += bytes.len
+        true
+    end write
+
+    flush(*self) -> bool = true
+
+    enter_raw_mode(*self) -> bool
+        self.raw = true
+        self.entered += 1
+        true
+
+    exit_raw_mode(*self)
+        self.raw = false
+        self.exited += 1
+
+    override columns(*self) -> usize = self.width
+end MockTerminal
+
+/** A mock terminal that will be sent `input` and writes into `output`, claiming no width. */
+mock_terminal(input: []const u8, output: []u8) -> MockTerminal =
+    MockTerminal(input, 0, output, 0, 0, None, false, 0, 0)

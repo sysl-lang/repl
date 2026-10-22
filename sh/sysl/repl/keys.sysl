@@ -1,0 +1,224 @@
+module sh.sysl.repl
+@no_alloc
+
+import sysl.math.min
+import sysl.text.char_from_u32
+
+/** What one keystroke means to a line editor.
+ *
+ * **The decoding is here, once, rather than in each terminal.** A keyboard sends the same bytes
+ * whether it is at the end of an ssh session, a macOS Terminal or a serial cable to a board, so the
+ * escape sequences are parsed in the core and a terminal only hands over bytes.
+ *
+ * Several spellings arrive for one key, and every one a common terminal sends is read:
+ *
+ * | key | bytes |
+ * |---|---|
+ * | Left, Right, Up, Down | `ESC [ D`, `ESC [ C`, `ESC [ A`, `ESC [ B`, or `ESC O …`; Ctrl-B, Ctrl-F, Ctrl-P, Ctrl-N |
+ * | Home | `ESC [ H`, `ESC O H`, `ESC [ 1 ~`, `ESC [ 7 ~`, Ctrl-A |
+ * | End | `ESC [ F`, `ESC O F`, `ESC [ 4 ~`, `ESC [ 8 ~`, Ctrl-E |
+ * | Delete | `ESC [ 3 ~` |
+ * | word left / right | `ESC [ 1 ; 5 D` / `C` (Ctrl), `ESC [ 1 ; 3 D` / `C` (Alt), `ESC b` / `ESC f` |
+ * | delete word left | Alt-Backspace (`ESC DEL`, `ESC BS`), Ctrl-W |
+ * | delete word right | Ctrl-Delete (`ESC [ 3 ; 5 ~`), Alt-Delete (`ESC [ 3 ; 3 ~`), `ESC d` |
+ *
+ * A sequence that names no key is read to its final byte and dropped, so its tail never lands in the
+ * line as text.
+ */
+enum Key
+    Char(c: char)
+    Enter
+    Tab
+    Backspace
+    Delete
+    Left
+    Right
+    Up
+    Down
+    Home
+    End
+    WordLeft
+    WordRight
+    DeleteWordLeft
+    DeleteWordRight
+    KillToEnd
+    KillToStart
+    ClearScreen
+    // Ctrl-C.
+    Interrupt
+    // Ctrl-D, which is end of input on an empty line and Delete on any other.
+    EndOfInput
+    // A control byte or a sequence that names nothing this editor does.
+    Ignored
+    // The terminal has no more bytes to give, including in the middle of a sequence or a character.
+    Eof
+end Key
+
+/** The replacement character, for bytes that are not UTF-8. */
+private const replacement: char = '\u{FFFD}'
+
+/** Turns a terminal's bytes into keys.
+ *
+ * **It is a struct for the one piece of state a key straddles**: a `\r\n` is a single Enter, and its
+ * two bytes are read by two calls. A terminal sends `\r` for Enter and a pipe sends `\n`; a file
+ * written on another system sends both, and reading that as two Enters would evaluate an empty line
+ * after every real one.
+ */
+struct KeyReader
+    owed_lf: bool
+
+    /** The next key, reading as many bytes as it takes. */
+    next(*self, t: *Terminal) -> Key
+        loop
+            val b = t.read_byte() match
+                Some(b) -> b
+                None -> return Eof
+
+            if b == 10 && self.owed_lf
+                self.owed_lf = false
+                continue
+
+            self.owed_lf = b == 13
+
+            return self.decode(t, b)
+    end next
+
+    private decode(*self, t: *Terminal, b: u8) -> Key
+        if b == 13 || b == 10 then return Enter
+        if b >= 32 && b < 127 then return Char(char(uint(b)))
+        if b >= 128 then return utf8_key(t, b)
+
+        b match
+            1   -> Home
+            2   -> Left
+            3   -> Interrupt
+            4   -> EndOfInput
+            5   -> End
+            6   -> Right
+            8   -> Backspace
+            9   -> Tab
+            11  -> KillToEnd
+            12  -> ClearScreen
+            14  -> Down
+            16  -> Up
+            21  -> KillToStart
+            23  -> DeleteWordLeft
+            27  -> escape(t)
+            127 -> Backspace
+            _   -> Ignored
+    end decode
+end KeyReader
+
+key_reader() -> KeyReader = KeyReader(false)
+
+/** What follows an escape byte. */
+private escape(t: *Terminal) -> Key
+    val b = t.read_byte() match
+        Some(b) -> b
+        None -> return Eof
+
+    if b == 127 || b == 8 then return DeleteWordLeft
+    if b == u8('b') then return WordLeft
+    if b == u8('f') then return WordRight
+    if b == u8('d') then return DeleteWordRight
+    if b == u8('[') || b == u8('O') then return sequence(t)
+
+    Ignored
+end escape
+
+/** The rest of `ESC [` or `ESC O`: up to two numeric parameters and a final byte.
+ *
+ * The first parameter picks a key in the `~` form (`3` is Delete) and the second is the modifier, as
+ * xterm numbers them: 3 is Alt and 5 is Ctrl. A parameter is capped rather than allowed to overflow,
+ * since a terminal is input and input can be anything.
+ */
+private sequence(t: *Terminal) -> Key
+    var first: uint = 0
+    var modifier: uint = 1
+    var which = 0
+
+    loop
+        val b = t.read_byte() match
+            Some(b) -> b
+            None -> return Eof
+
+        if b >= u8('0') && b <= u8('9')
+            val d = uint(b - u8('0'))
+
+            if which == 0 then first = min(first * 10 + d, 1000)
+            elif which == 1 then modifier = min(modifier * 10 + d, 1000)
+        elif b == u8(';')
+            which += 1
+            if which == 1 then modifier = 0
+        elif b >= 64 && b <= 126
+            return final_key(b, first, modifier)
+        elif b < 32 || b > 126
+            // Not a sequence after all: a terminal never puts a control byte inside one.
+            return Ignored
+end sequence
+
+private final_key(b: u8, first: uint, modifier: uint) -> Key
+    // Alt or Ctrl, alone or with Shift (4, 6, 7, 8).
+    val by_word = modifier >= 3
+
+    if b == u8('~')
+        return first match
+            1 | 7 -> Home
+            4 | 8 -> End
+            3     -> if by_word then DeleteWordRight else Delete
+            _     -> Ignored
+
+    if b == u8('A') then Up
+    elif b == u8('B') then Down
+    elif b == u8('C') then (if by_word then WordRight else Right)
+    elif b == u8('D') then (if by_word then WordLeft else Left)
+    elif b == u8('H') then Home
+    elif b == u8('F') then End
+    else Ignored
+end final_key
+
+/** A character of more than one byte, read the rest of the way.
+ *
+ * A malformed lead or a missing continuation answers U+FFFD rather than failing, which is what a
+ * terminal does with bytes it cannot read; the line therefore holds valid UTF-8 by construction. A
+ * continuation byte that is not one is dropped with the character it was supposed to finish -- the
+ * cost of not being able to push a byte back.
+ */
+private utf8_key(t: *Terminal, b0: u8) -> Key
+    var more = 0
+    var u: u32 = 0
+
+    if b0 & 224 == 192
+        more = 1
+        u = u32(b0 & 31)
+    elif b0 & 240 == 224
+        more = 2
+        u = u32(b0 & 15)
+    elif b0 & 248 == 240
+        more = 3
+        u = u32(b0 & 7)
+    else
+        return Char(replacement)
+
+    var bad = false
+
+    for _ in 0..<more
+        val b = t.read_byte() match
+            Some(b) -> b
+            None -> return Eof
+
+        if b & 192 != 128 then bad = true
+
+        u = (u << 6) | u32(b & 63)
+
+    if bad then return Char(replacement)
+
+    // Overlong forms and surrogates are refused by `char_from_u32` or by the width check here.
+    val least: u32 = if more == 1 then 0x80 elif more == 2 then 0x800 else 0x10000
+
+    if u < least then return Char(replacement)
+
+    char_from_u32(u) match
+        Some(c) -> Char(c)
+        None -> Char(replacement)
+end utf8_key

@@ -1,0 +1,271 @@
+module sh.sysl.repl
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.str_view
+
+// The loop, through a `MockTerminal`: what the evaluator is handed, what it answers, what reaches the
+// terminal, and what the history keeps.
+
+/** A loop over fresh storage, with `join` bytes for a whole input. */
+struct Loop
+    t: MockTerminal
+    ed: Editor
+    join: []u8
+
+private loop_of(input: string, join_cap: usize) -> Loop
+    val out: []u8 = [0; 65536]
+    val line: []u8 = [0; 64]
+    val draft: []u8 = [0; 64]
+    val store: []u8 = [0; 256]
+    val join: []u8 = [0; join_cap]
+
+    Loop(mock_terminal(input.bytes, out), editor(line, draft, store, 8), join)
+end loop_of
+
+/** What an echoing evaluator was handed, input by input; a trailing `\` asks for more, `bye` quits. */
+private struct Seen
+    inputs: Buf[string]
+
+private echo_run(l: *Loop, p: Prompts, seen: *Seen) -> Ended =
+    run(&l.ed, &l.t, l.join, p, (text, out) ->
+        seen.inputs.push(text.copy())
+
+        if text == "bye" then return Quit
+        if text.ends_with("\\") then return More
+
+        out.print(text)
+        Done)
+
+private inputs(seen: *Seen) -> string
+    var all = ""
+
+    for i in 0..<seen.inputs.len()
+        if i > 0 then all = all + "|"
+
+        all = all + seen.inputs[i]
+
+    all
+end inputs
+
+@test("each line is evaluated and what it prints follows it, CRLF and all")
+read_eval_print()
+    var l = loop_of("a\rb\r", 256)
+    var seen = Seen(buf())
+
+    assert(echo_run(&l, prompts("> "), &seen) == EndOfInput)
+    assert_eq(inputs(&seen), "a|b")
+    assert(l.t.text().contains("\r> a\u{1b}[0K\r\u{1b}[3C\r\na\r\n\r> "))
+
+@test("an evaluator answering More gets the continuation prompt and the lines joined")
+continuation()
+    var l = loop_of("a\\\rb\r", 256)
+    var seen = Seen(buf())
+
+    echo_run(&l, Prompts("> ", ".. ", ""), &seen)
+    assert_eq(inputs(&seen), "a\\|a\\\nb")
+    assert(l.t.text().contains("\r.. b\u{1b}[0K"))
+
+@test("a continued input is one history entry, its line breaks as spaces")
+continuation_history()
+    var l = loop_of("a\\\rb\r", 256)
+    var seen = Seen(buf())
+
+    echo_run(&l, prompts("> "), &seen)
+    assert_eq(l.ed.history.len(), 1)
+    assert_eq(l.ed.history.get(0), "a\\ b")
+
+@test("the loop's history is reached with Up like any other")
+loop_history_up()
+    var l = loop_of("x\r\u{1b}[A\r", 256)
+    var seen = Seen(buf())
+
+    echo_run(&l, prompts("> "), &seen)
+    assert_eq(inputs(&seen), "x|x")
+    assert_eq(l.ed.history.len(), 1)
+
+@test("an editor that does not record keeps no history in the loop either, and is left as it was")
+loop_without_history()
+    var l = loop_of("x\r", 256)
+    var seen = Seen(buf())
+
+    l.ed.records = false
+    echo_run(&l, prompts("> "), &seen)
+    assert(l.ed.history.is_empty())
+    assert(!l.ed.records)
+
+@test("the loop leaves the editor recording afterwards, as it found it")
+loop_restores_records()
+    var l = loop_of("x\\\ry\r", 256)
+    var seen = Seen(buf())
+
+    echo_run(&l, prompts("> "), &seen)
+    assert(l.ed.records)
+
+@test("Quit records the input and ends the loop, reading nothing after it")
+quit()
+    var l = loop_of("bye\rnext\r", 256)
+    var seen = Seen(buf())
+
+    assert(echo_run(&l, prompts("> "), &seen) == Quit)
+    assert_eq(inputs(&seen), "bye")
+    assert_eq(l.ed.history.get(0), "bye")
+
+@test("Ctrl-C abandons a continued input and the next line starts fresh")
+ctrl_c_drops_the_continuation()
+    var l = loop_of("a\\\r\u{3}b\r", 256)
+    var seen = Seen(buf())
+
+    echo_run(&l, prompts("> "), &seen)
+    assert_eq(inputs(&seen), "a\\|b")
+
+@test("Ctrl-D on an empty line ends the loop")
+ctrl_d_ends_the_loop()
+    var l = loop_of("a\r\u{4}b\r", 256)
+    var seen = Seen(buf())
+
+    assert(echo_run(&l, prompts("> "), &seen) == EndOfInput)
+    assert_eq(inputs(&seen), "a")
+
+@test("a banner is printed once, before the first prompt")
+banner()
+    var l = loop_of("", 256)
+    var seen = Seen(buf())
+
+    echo_run(&l, Prompts("> ", ". ", "hello"), &seen)
+    assert(l.t.text().starts_with("hello\r\n\r> "))
+
+@test("output not ending a line gets one before the next prompt, which would overwrite it")
+unterminated_output()
+    var l = loop_of("a\r", 256)
+
+    run(&l.ed, &l.t, l.join, prompts("> "), (text, out) ->
+        out.prints("=" + text)
+        Done)
+    assert(l.t.text().contains("\r\n=a\r\n\r> "))
+
+@test("every newline an evaluation writes goes out as CRLF")
+crlf_translation()
+    var l = loop_of("a\r", 256)
+
+    run(&l.ed, &l.t, l.join, prompts("> "), (text, out) ->
+        out.prints("one\ntwo\n\nthree\n")
+        Done)
+    assert(l.t.text().contains("one\r\ntwo\r\n\r\nthree\r\n"))
+
+@test("an input longer than the join buffer is refused with a message, and the loop goes on")
+join_overflow()
+    var l = loop_of("abcdef\\\rgh\rok\r", 8)
+    var seen = Seen(buf())
+
+    echo_run(&l, prompts("> "), &seen)
+    assert_eq(inputs(&seen), "abcdef\\|ok")
+    assert(l.t.text().contains("input too long\r\n"))
+
+@test("a terminal that refuses a write ends the loop as Failed")
+loop_write_fails()
+    var l = loop_of("a\rb\r", 256)
+    var seen = Seen(buf())
+
+    l.t.writes_left = Some(6)
+    assert(echo_run(&l, prompts("> "), &seen) == Failed)
+
+@test("a banner that cannot be written fails at once")
+banner_write_fails()
+    var l = loop_of("a\r", 256)
+    var seen = Seen(buf())
+
+    l.t.writes_left = Some(0)
+    assert(echo_run(&l, Prompts("> ", ". ", "hi"), &seen) == Failed)
+    assert_eq(inputs(&seen), "")
+
+@test("output that cannot be written fails the loop")
+output_write_fails()
+    var l = loop_of("a\rb\r", 256)
+    // A closure captures by value, so what it changes is reached through a pointer and a buffer.
+    val term: *MockTerminal = &l.t
+    var calls: Buf[string] = buf()
+
+    val ended = run(&l.ed, term, l.join, prompts("> "), (text, out) ->
+        calls.push(text.copy())
+        term.writes_left = Some(0)
+        out.print(text)
+        Done)
+
+    assert(ended == Failed)
+    assert_eq(calls.len(), 1)
+
+@test("Out is a Writer, so a value renders into it")
+out_is_a_writer()
+    var l = loop_of("a\r", 256)
+
+    run(&l.ed, &l.t, l.join, prompts("> "), (text, out) ->
+        42.display(out, FormatSpec(0, -1, false))
+        out.print("")
+        Done)
+    assert(l.t.text().contains("42\r\n"))
+
+@test("completion and hints reach the editor through the loop")
+loop_completion_and_hints()
+    var l = loop_of("hi\t\r", 256)
+    var got: Buf[string] = buf()
+
+    run_with(&l.ed, &l.t, l.join, prompts("> "), (word, i) -> if i == 0 then Some("history") else None,
+             line -> if line == "hi" then Some("story") else None, (text, out) ->
+        got.push(text.copy())
+        Done)
+
+    assert_slice_eq(got.view(), ["history"])
+    assert(l.t.text().contains("\r> hi\u{1b}[2mstory\u{1b}[0m"))
+
+// -- with no heap -----------------------------------------------------------------------------------
+
+// The storage a board would have: module-level arrays, and nothing else.
+private var line_store: [64]u8 = [0; 64]
+private var draft_store: [64]u8 = [0; 64]
+private var history_store: [256]u8 = [0; 256]
+private var join_store: [128]u8 = [0; 128]
+private var out_store: [1024]u8 = [0; 1024]
+private val script: [12]u8 = [104, 105, 13, 27, 91, 65, 13, 98, 121, 101, 13, 0]
+
+/** A whole session -- two reads, a recall with Up, an evaluation that writes, and a quit -- held to
+ * `@no_alloc`, so the compiler refuses this file if any of it reaches the allocator.
+ */
+@no_alloc
+private session_without_a_heap() -> usize
+    var t = mock_terminal(script[0..<11], out_store)
+    var ed = editor(line_store, draft_store, history_store, 4)
+
+    val ended = run(&ed, &t, join_store, prompts("> "), (text, out) ->
+        if text == "bye" then return Quit
+
+        out.print(text)
+        Done)
+
+    if ended != Quit then return 0
+
+    t.written
+end session_without_a_heap
+
+@test("the editor and the loop run on fixed storage with no allocation")
+no_heap_session()
+    val written = session_without_a_heap()
+
+    assert(written > 0)
+
+    val shown = str_view(out_store[0..<written])
+
+    // `hi` echoed, then an empty prompt, Up drawing `hi` again, Enter, and `hi` echoed a second time.
+    assert(shown.contains("\r\nhi\r\n\r> \u{1b}[0K\r\u{1b}[2C\r> hi\u{1b}[0K\r\u{1b}[4C" +
+                          "\r> hi\u{1b}[0K\r\u{1b}[4C\r\nhi\r\n"))
+    assert_eq(str_view(history_store[2..<4]), "hi")
+
+@test("a full fixed history keeps working, dropping its oldest entries")
+no_heap_history_wraps()
+    var store: [12]u8 = [0; 12]
+    var h = history(store, 100)
+
+    for s in ["aaaa", "bbbb", "cccc", "dddd"] do h.add(s)
+
+    assert_eq(h.len(), 2)
+    assert_eq(h.get(0), "cccc")

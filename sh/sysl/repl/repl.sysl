@@ -1,0 +1,160 @@
+module sh.sysl.repl
+@no_alloc
+
+import sysl.text.str_view
+
+/** What an evaluation asks the loop to do next. */
+enum Outcome
+    /** The input was complete and has been dealt with: record it and prompt again. */
+    Done
+    /** The input is not finished -- an open bracket, a definition still going. The loop shows the
+     * continuation prompt and joins the next line on with a newline.
+     */
+    More
+    /** Leave the loop, as a `bye` or `quit` would. The input is recorded first. */
+    Quit
+end Outcome
+
+/** Why the loop ended. */
+enum Ended
+    /** Ctrl-D on an empty line, or the input ran out. */
+    EndOfInput
+    /** The evaluator answered `Quit`. */
+    Quit
+    /** The terminal refused a write. */
+    Failed
+end Ended
+
+/** What the loop says: the prompt, the prompt for a continuation line, and an optional banner printed
+ * once at the start (`""` prints nothing).
+ */
+struct Prompts
+    prompt: string
+    more: string
+    banner: string
+
+/** The prompts `"> "` and `". "`, and no banner. */
+prompts(prompt: string) -> Prompts = Prompts(prompt, ". ", "")
+
+/** Where an evaluation writes, which is the terminal.
+ *
+ * **Every `\n` goes out as `\r\n`**, because a terminal in raw mode on a board -- or a host's with
+ * output processing off -- moves down a row on `\n` and leaves the cursor where it was. A terminal that
+ * does translate shows the same thing either way.
+ *
+ * It is a `Writer`, so anything that renders itself into one (`display`, `debug`) renders here.
+ */
+struct Out
+    term: *Terminal
+    bad: bool
+    // Whether the last byte written ended a line, so the loop knows if the next prompt needs a fresh
+    // row: a prompt is drawn from column zero and would otherwise overwrite the end of the output.
+    at_line_start: bool
+
+    /** Writes `s` and a line break. */
+    print(*self, s: string)
+        self.write(s.bytes)
+        self.write("\n".bytes)
+
+    /** Writes `s` with nothing after it. */
+    prints(*self, s: string) = self.write(s.bytes)
+end Out
+
+impl Fallible for Out
+    override failed(*self) -> bool = self.bad
+
+impl Writer for Out
+    write(*self, bytes: []const u8)
+        if self.bad || bytes.len == 0 then return
+
+        var from = 0
+
+        for i in 0..<bytes.len
+            if bytes[i] == 10
+                if !self.term.write(bytes[from..<i]) || !self.term.write("\r\n".bytes) then self.bad = true
+
+                from = i + 1
+
+        if from < bytes.len && !self.term.write(bytes[from..<bytes.len]) then self.bad = true
+
+        self.at_line_start = bytes[bytes.len - 1] == 10
+    end write
+end Out
+
+/** A read-eval-print loop over `ed` and `t`, joining continuation lines in `join`.
+ *
+ * Each line read is added to what is in `join` and the whole is handed to `eval`, with an `Out` to
+ * write to. `Done` records the input in the history -- a continued input as one entry, its line breaks
+ * as spaces -- and prompts again; `More` keeps it and shows `p.more`; `Quit` records it and returns.
+ * Ctrl-C abandons the input, continuation and all, and prompts again; Ctrl-D on an empty line, or the
+ * end of the input, returns.
+ *
+ * `join` bounds a whole input, continuation lines included. An input that would not fit is refused
+ * with a message, and the loop goes on.
+ */
+run(ed: *Editor, t: *Terminal, join: []u8, p: Prompts, eval: (string, *Out) -> Outcome) -> Ended =
+    run_with(ed, t, join, p, no_completion, no_hint, eval)
+
+/** `run`, with completion and hints wired through to every line read (see `Editor.read_line_with`).
+ * The evaluator is the last parameter, so it can be written as a block after the call.
+ */
+run_with(ed: *Editor, t: *Terminal, join: []u8, p: Prompts, complete: (string, usize) -> Option[string],
+         hint: string -> Option[string], eval: (string, *Out) -> Outcome) -> Ended
+    var out = Out(t, false, true)
+    var held: usize = 0
+    val records = ed.records
+
+    // The loop records whole inputs itself, so a continued one is one entry rather than several.
+    ed.records = false
+    defer ed.records = records
+
+    if p.banner.len > 0
+        out.print(p.banner)
+
+        if out.bad || !t.flush() then return Failed
+
+    loop
+        if !out.at_line_start
+            out.write("\n".bytes)
+            out.at_line_start = true
+
+        if out.bad then return Failed
+
+        val prompt = if held == 0 then p.prompt else p.more
+
+        val line = ed.read_line_with(t, prompt, complete, hint) match
+            Line(text) -> text
+            Interrupted ->
+                held = 0
+                continue
+            Eof -> return EndOfInput
+            Failed -> return Failed
+
+        val need = if held == 0 then line.len else line.len + 1
+
+        if held + need > join.len
+            held = 0
+            out.print("input too long")
+            continue
+
+        if held > 0
+            join[held] = 10
+            held += 1
+
+        for k in 0..<line.len do join[held + k] = line.bytes[k]
+
+        held += line.len
+
+        val outcome = eval(str_view(join[0..<held]), &out)
+
+        if outcome == More then continue
+
+        // One input is one history entry, so a continued one is recorded on one row.
+        for k in 0..<held do if join[k] == 10 then join[k] = u8(' ')
+
+        if records then ed.history.add(str_view(join[0..<held]))
+        held = 0
+
+        if !t.flush() || out.bad then return Failed
+        if outcome == Quit then return Quit
+end run_with

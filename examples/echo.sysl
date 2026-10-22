@@ -1,0 +1,43 @@
+// An echo REPL at the terminal: every line comes back, `bye` leaves, and a line ending in `\` goes on
+// to the next. Tab completes the three words it knows, and typing the start of one shows the rest of
+// it dimmed.
+//
+//     sysl run examples/echo.sysl
+//
+// The history is kept in `~/.repl_echo_history` between runs.
+
+import sh.sysl.repl.{Done, More, Quit}
+import sh.sysl.repl.host.{config, home_file, repl_with}
+
+static val words = ["hello", "help", "history"]
+
+// The `i`th word that starts with `word`.
+complete(word: string, i: usize) -> Option[string]
+    var seen: usize = 0
+
+    for w in words
+        if w.starts_with(word)
+            if seen == i then return Some(w)
+
+            seen += 1
+
+    None
+end complete
+
+// The rest of the one word the line is the start of.
+hint(line: string) -> Option[string]
+    for w in words do if line.len > 0 && w.len > line.len && w.starts_with(line) then return Some(w[line.len..])
+
+    None
+
+var c = config("echo> ")
+
+c.prompts.banner = "echo REPL -- Ctrl-D or `bye` to leave"
+c.history_file = home_file(".repl_echo_history")
+
+repl_with(c, complete, hint, (line, out) ->
+    if line == "bye" then return Quit
+    if line.ends_with("\\") then return More
+
+    out.print(line)
+    Done)

@@ -1,0 +1,99 @@
+module sh.sysl.repl
+@no_alloc
+
+import sysl.text.str_view
+
+/** The lines already entered, oldest first, in a fixed number of bytes.
+ *
+ * **The storage is one slice of bytes, packed**: each entry is a two-byte length and its text, end to
+ * end. A board's history is therefore a module-level array and nothing else, and short lines -- which
+ * most are -- cost what they hold rather than a whole fixed-width slot each. When an entry will not
+ * fit, the oldest ones go until it does; when there are `limit` entries already, the oldest goes too.
+ * Dropping one moves the rest down, which costs the history's size in bytes on an entry that is
+ * already a keystroke away from the person typing it.
+ *
+ * Two kinds of line are never recorded, which is what makes Up useful: a blank one, and one equal to
+ * the newest entry. Leading and trailing whitespace is trimmed first, so `  ls ` and `ls` are the same
+ * entry.
+ */
+struct History
+    store: []u8
+    used: usize
+    count: usize
+    limit: usize
+
+    /** How many entries there are. */
+    len(self) -> usize = self.count
+
+    is_empty(self) -> bool = self.count == 0
+
+    /** Entry `i`, counting from the oldest at 0. It shares the history's storage, and is valid until
+     * the next `add` or `clear`.
+     */
+    get(self, i: usize) -> string
+        var at = 0
+
+        for _ in 0..<i do at += 2 + self.length_at(at)
+
+        val n = self.length_at(at)
+
+        str_view(self.store[at + 2..<at + 2 + n])
+    end get
+
+    /** Entry `k` back from the newest, which is 0. */
+    newest(self, k: usize) -> string = self.get(self.count - 1 - k)
+
+    /** Records `line`, answering whether it was: `false` for a blank line, a repeat of the newest
+     * entry, or a line too long for the whole store.
+     */
+    add(*self, line: string) -> bool
+        val text = trimmed(line)
+        val n = text.len
+
+        if n == 0 then return false
+        if self.count > 0 && self.newest(0) == text then return false
+        if n > 65535 || n + 2 > self.store.len || self.limit == 0 then return false
+
+        while self.count >= self.limit || self.used + n + 2 > self.store.len do self.drop_oldest()
+
+        self.store[self.used] = u8(n & 255)
+        self.store[self.used + 1] = u8(n >> 8)
+
+        for k in 0..<n do self.store[self.used + 2 + k] = text.bytes[k]
+
+        self.used += n + 2
+        self.count += 1
+        true
+    end add
+
+    clear(*self)
+        self.used = 0
+        self.count = 0
+
+    private length_at(self, at: usize) -> usize = usize(self.store[at]) | (usize(self.store[at + 1]) << 8)
+
+    private drop_oldest(*self)
+        val gone = 2 + self.length_at(0)
+
+        for k in gone..<self.used do self.store[k - gone] = self.store[k]
+
+        self.used -= gone
+        self.count -= 1
+    end drop_oldest
+end History
+
+/** A history over `storage`, keeping at most `limit` entries -- and fewer when they do not fit. */
+history(storage: []u8, limit: usize) -> History = History(storage, 0, 0, limit)
+
+/** `s` without the spaces, tabs and line breaks at either end. */
+private trimmed(s: string) -> string
+    var a = 0
+    var b = s.len
+
+    while a < b && blank(s.bytes[a]) do a += 1
+    while b > a && blank(s.bytes[b - 1]) do b -= 1
+
+    s[a..<b]
+end trimmed
+
+private blank(b: u8) -> bool = b == u8(' ') || b == u8('\t') || b == u8('\r') || b == u8('\n')

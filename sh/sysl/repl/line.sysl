@@ -1,0 +1,278 @@
+module sh.sysl.repl
+@no_alloc
+
+import sysl.math.min
+import sysl.text.str_view
+
+/** The line being edited: UTF-8 bytes in storage somebody else owns, and a cursor.
+ *
+ * **The storage is a slice handed in, which is what makes it work with no allocator.** A board passes
+ * a module-level array; a host passes one it allocated. Its length is the capacity, and a keystroke
+ * that would not fit is refused (`insert` answers `false`) rather than growing anything.
+ *
+ * **The cursor is a byte index that is always on a character boundary.** Every move and every
+ * deletion steps over a whole code point, so a multibyte character can never be split -- and since
+ * only whole characters are ever inserted, the bytes are valid UTF-8 at every moment, which is what
+ * lets `text` hand them out as a `string` without checking.
+ */
+struct LineBuffer
+    bytes: []u8
+    len: usize
+    at: usize
+
+    /** The line as text, sharing the storage: valid until the next edit. */
+    text(self) -> string = str_view(self.bytes[0..<self.len])
+
+    /** The part of the line before the cursor, sharing the storage like `text`. */
+    before(self) -> string = str_view(self.bytes[0..<self.at])
+
+    capacity(self) -> usize = self.bytes.len
+
+    is_empty(self) -> bool = self.len == 0
+
+    at_end(self) -> bool = self.at == self.len
+
+    clear(*self)
+        self.len = 0
+        self.at = 0
+
+    /** Inserts one character at the cursor and moves past it. `false`, and nothing changed, when the
+     * buffer has no room for it.
+     */
+    insert(*self, c: char) -> bool
+        var enc: [4]u8 = [0; 4]
+        val n = encode(c, enc)
+
+        self.insert_bytes(enc[0..<n])
+    end insert
+
+    /** Inserts text at the cursor, all of it or -- when it does not fit -- none of it. */
+    insert_text(*self, s: string) -> bool = self.insert_bytes(s.bytes)
+
+    private insert_bytes(*self, src: []const u8) -> bool
+        val n = src.len
+
+        if n > self.bytes.len - self.len then return false
+
+        var i = self.len
+
+        while i > self.at
+            i -= 1
+            self.bytes[i + n] = self.bytes[i]
+
+        for k in 0..<n do self.bytes[self.at + k] = src[k]
+
+        self.len += n
+        self.at += n
+        true
+    end insert_bytes
+
+    /** Replaces the whole line, cursor at the end. Text longer than the buffer is cut at the last whole
+     * character that fits.
+     */
+    load(*self, src: []const u8)
+        var n = min(src.len, self.bytes.len)
+
+        // Step back off a character the cut would split.
+        if n < src.len
+            while n > 0 && !boundary(src[n]) do n -= 1
+
+        for k in 0..<n do self.bytes[k] = src[k]
+
+        self.len = n
+        self.at = n
+    end load
+
+    left(*self) -> bool
+        if self.at == 0 then return false
+
+        self.at = self.prev(self.at)
+        true
+
+    right(*self) -> bool
+        if self.at == self.len then return false
+
+        self.at = self.next(self.at)
+        true
+
+    to_start(*self) -> bool
+        val moved = self.at != 0
+
+        self.at = 0
+        moved
+
+    to_end(*self) -> bool
+        val moved = self.at != self.len
+
+        self.at = self.len
+        moved
+
+    backspace(*self) -> bool
+        if self.at == 0 then return false
+
+        val from = self.prev(self.at)
+
+        self.remove(from, self.at)
+        true
+
+    delete(*self) -> bool
+        if self.at == self.len then return false
+
+        self.remove(self.at, self.next(self.at))
+        true
+
+    word_left(*self) -> bool
+        val to = self.word_start_left()
+        val moved = to != self.at
+
+        self.at = to
+        moved
+
+    word_right(*self) -> bool
+        val to = self.word_start_right()
+        val moved = to != self.at
+
+        self.at = to
+        moved
+
+    delete_word_left(*self) -> bool
+        val from = self.word_start_left()
+
+        if from == self.at then return false
+
+        self.remove(from, self.at)
+        true
+
+    delete_word_right(*self) -> bool
+        val to = self.word_start_right()
+
+        if to == self.at then return false
+
+        self.remove(self.at, to)
+        true
+
+    kill_to_end(*self) -> bool
+        if self.at == self.len then return false
+
+        self.len = self.at
+        true
+
+    kill_to_start(*self) -> bool
+        if self.at == 0 then return false
+
+        self.remove(0, self.at)
+        true
+
+    /** Where the character before byte `i` starts. */
+    prev(self, i: usize) -> usize
+        var j = i - 1
+
+        while j > 0 && !boundary(self.bytes[j]) do j -= 1
+
+        j
+    end prev
+
+    /** Where the character after the one at byte `i` starts. */
+    next(self, i: usize) -> usize
+        var j = i + 1
+
+        while j < self.len && !boundary(self.bytes[j]) do j += 1
+
+        j
+    end next
+
+    /** The class of the character starting at byte `i`. */
+    private class_at(self, i: usize) -> Class = class_of(self.bytes[i])
+
+    /** The start of the word left of the cursor: whitespace skipped, then a run of one class. */
+    private word_start_left(self) -> usize
+        var i = self.at
+
+        while i > 0 && self.class_at(self.prev(i)) == Space do i = self.prev(i)
+
+        if i == 0 then return 0
+
+        val kind = self.class_at(self.prev(i))
+
+        while i > 0 && self.class_at(self.prev(i)) == kind do i = self.prev(i)
+
+        i
+    end word_start_left
+
+    /** The start of the word right of the cursor: a run of one class skipped, then whitespace. */
+    private word_start_right(self) -> usize
+        var i = self.at
+
+        if i < self.len
+            val kind = self.class_at(i)
+
+            if kind != Space
+                while i < self.len && self.class_at(i) == kind do i = self.next(i)
+
+        while i < self.len && self.class_at(i) == Space do i = self.next(i)
+
+        i
+    end word_start_right
+
+    private remove(*self, from: usize, to: usize)
+        val n = to - from
+
+        for k in to..<self.len do self.bytes[k - n] = self.bytes[k]
+
+        self.len -= n
+
+        if self.at >= to then self.at -= n
+        elif self.at > from then self.at = from
+    end remove
+end LineBuffer
+
+/** A line buffer over `storage`, empty. */
+line_buffer(storage: []u8) -> LineBuffer = LineBuffer(storage, 0, 0)
+
+/** What a word is made of, for the word-wise keys.
+ *
+ * **A symbol is a word of its own**, as in the editor this package descends from: in `x+=y-1` the
+ * stops are `x`, `+=`, `y`, `-` and `1`, which is what moving through an expression at a REPL wants.
+ * Any character beyond ASCII is a word character, so `naïve` and `日本語` are one word each.
+ */
+enum Class
+    Space
+    Word
+    Symbol
+
+private class_of(b: u8) -> Class
+    if b == u8(' ') || b == u8('\t') then Space
+    elif b >= 128 || b == u8('_') || is_alnum(b) then Word
+    else Symbol
+
+private is_alnum(b: u8) -> bool =
+    (b >= u8('a') && b <= u8('z')) || (b >= u8('A') && b <= u8('Z')) || (b >= u8('0') && b <= u8('9'))
+
+/** Whether a byte starts a character rather than continuing one. */
+private[repl] boundary(b: u8) -> bool = b & 192 != 128
+
+/** `c` as UTF-8 into `out`, answering how many bytes it took. */
+private[repl] encode(c: char, out: []u8) -> usize
+    val u = u32(c)
+
+    if u < 0x80
+        out[0] = u8(u)
+        return 1
+
+    if u < 0x800
+        out[0] = u8(192 | (u >> 6))
+        out[1] = u8(128 | (u & 63))
+        return 2
+
+    if u < 0x10000
+        out[0] = u8(224 | (u >> 12))
+        out[1] = u8(128 | ((u >> 6) & 63))
+        out[2] = u8(128 | (u & 63))
+        return 3
+
+    out[0] = u8(240 | (u >> 18))
+    out[1] = u8(128 | ((u >> 12) & 63))
+    out[2] = u8(128 | ((u >> 6) & 63))
+    out[3] = u8(128 | (u & 63))
+    4
+end encode

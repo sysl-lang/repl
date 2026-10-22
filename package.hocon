@@ -1,0 +1,21 @@
+// A line editor and a read-eval-print loop for sysl, the same on a host and on a board.
+//
+// This is the block a consumer writes to reach it:
+//
+//     dependencies {
+//       repl { git = "github.com/sysl-lang/repl", version = "0.1.0" }
+//     }
+//
+// The coordinate names the package, `repl`. It has two modules:
+//
+// - `sh.sysl.repl` -- the editor, the key decoder, the history, the loop and a mock terminal. It is
+//   `@no_alloc` and declares no capability, so it builds for a freestanding target with no heap.
+// - `sh.sysl.repl.host` -- the Unix terminal (raw mode through `sysl.tty`, the width through
+//   `TIOCGWINSZ`), history saved to a file, and an editor whose storage is allocated. It requires
+//   `os`, `posix` and `libc`, and a program on a board never imports it.
+
+package {
+  name    = "repl"
+  version = "0.1.0"
+  sysl    = "0.3.12"
+}

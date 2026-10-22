@@ -1,0 +1,165 @@
+module sh.sysl.repl.host
+@requires(os, posix, libc)
+
+import sh.sysl.repl.{Editor, Ended, Out, Outcome, Prompts, Terminal, editor, no_completion, no_hint,
+                     prompts, run_with}
+import sysl.buf.{Buf, buf}
+import sysl.fs.{IoError, exists, home_dir, read_text, write_bytes}
+import sysl.io.{FdReader, fd_reader}
+import sysl.posix.tty.is_tty
+import sysl.text.split
+import sysl.tty
+
+/** The pieces of a REPL only a host has: its terminal, a file for the history, and an allocator.
+ *
+ * **Nothing here decodes a key or draws a line** -- that is all `sh.sysl.repl`, which this module only
+ * hands a terminal to. What is here is the Unix half: raw mode through `sysl.tty` (which puts the
+ * terminal back at exit even when the program never does), the window's width through
+ * `TIOCGWINSZ`, and the history read from and written to a file.
+ */
+
+// `ioctl` is variadic in C, and declared so: on arm64 macOS a variadic argument travels on the stack
+// rather than in a register, so declaring the pointer as a fixed third parameter would hand the kernel
+// whatever was in the register instead.
+private extern "ioctl" c_ioctl(fd: int, request: ulong, ...) -> int
+
+// The request that reads a terminal's size into a `struct winsize` -- four `unsigned short`s, rows
+// first and columns second. Its number differs between the two families.
+#if bsd
+private const tiocgwinsz: ulong = 0x40087468
+#else
+private const tiocgwinsz: ulong = 0x5413
+#endif
+
+/** The terminal this process was started at: standard input, standard output, and their mode.
+ *
+ * Output goes through the same buffered sink `print` does and is flushed at every `flush`, so what an
+ * evaluation prints with `print` and what the editor draws arrive in the order they were written.
+ */
+struct UnixTerminal
+    input: FdReader
+
+impl Terminal for UnixTerminal
+    read_byte(*self) -> Option[u8]
+        var one: [1]u8 = [0; 1]
+        val got = self.input.read(one)
+
+        if got.len == 0 then None else Some(got[0])
+
+    write(*self, bytes: []const u8) -> bool
+        putbytes(bytes)
+        true
+
+    flush(*self) -> bool
+        sysl.flush()
+        true
+
+    /** Raw mode, when standard input is a terminal. Input from a pipe or a file answers `false`, and
+     * the editor reads it as it comes.
+     */
+    enter_raw_mode(*self) -> bool = is_tty(0) && tty.raw()
+
+    exit_raw_mode(*self) = tty.cooked()
+
+    override columns(*self) -> usize
+        var size: [4]u16 = [0; 4]
+
+        if c_ioctl(1, tiocgwinsz, &size[0]) != 0 then return 0
+
+        usize(size[1])
+end UnixTerminal
+
+/** The terminal on standard input and output. */
+unix_terminal() -> UnixTerminal = UnixTerminal(fd_reader(0))
+
+/** An editor whose storage is allocated: a line of up to `line_cap` bytes, and `history_bytes` of
+ * history holding at most `limit` entries.
+ */
+hosted_editor(line_cap: usize, history_bytes: usize, limit: usize) -> Editor
+    val line: []u8 = [0; line_cap]
+    val draft: []u8 = [0; line_cap]
+    val store: []u8 = [0; history_bytes]
+
+    editor(line, draft, store, limit)
+end hosted_editor
+
+/** Adds every line of `file` to the history, oldest first, and answers how many were recorded. A file
+ * that does not exist is an empty history, not an error.
+ */
+load_history(ed: *Editor, file: string) -> Result[usize, IoError]
+    if !exists(file) then return Ok(0)
+
+    var added: usize = 0
+
+    for line in split(read_text(file)?, "\n") do if ed.history.add(line) then added += 1
+
+    Ok(added)
+end load_history
+
+/** Writes the history to `file`, one entry per line, oldest first, replacing what was there. */
+save_history(ed: *Editor, file: string) -> Result[unit, IoError]
+    var out: Buf[u8] = buf()
+
+    for i in 0..<ed.history.len()
+        out.extend(ed.history.get(i).bytes)
+        out.push(10)
+
+    write_bytes(file, out.view())
+end save_history
+
+/** `name` in the user's home directory -- where a history file usually goes -- or `name` itself where
+ * there is no home directory.
+ */
+home_file(name: string) -> string = home_dir() match
+    Some(home) -> home + "/" + name
+    None -> name
+
+/** What a hosted REPL needs beyond its evaluator. */
+struct Config
+    prompts: Prompts
+    /** The history file, loaded at the start and saved at the end; `""` keeps no file. */
+    history_file: string
+    line_cap: usize
+    history_bytes: usize
+    history_limit: usize
+
+/** The defaults: `prompt` and `". "` for continuations, no banner, no history file, lines of up to
+ * 4096 bytes and 64 KiB of history holding at most 1000 entries.
+ */
+config(prompt: string) -> Config = Config(prompts(prompt), "", 4096, 65536, 1000)
+
+/** A whole REPL at the terminal this process was started at.
+ *
+ *     repl(config("echo> "), (line, out) ->
+ *         out.print(line)
+ *         Done)
+ *
+ * The history file, when there is one, is loaded first and saved when the loop ends -- whichever way
+ * it ends. A file that cannot be read or written is reported on standard error and the loop goes on
+ * without it, since losing the history is not a reason to refuse to run.
+ */
+repl(c: Config, eval: (string, *Out) -> Outcome) -> Ended = repl_with(c, no_completion, no_hint, eval)
+
+/** `repl`, with Tab completion and hints (see `sh.sysl.repl.Editor.read_line_with`). The evaluator is
+ * last, so it can be written as a block after the call.
+ */
+repl_with(c: Config, complete: (string, usize) -> Option[string], hint: string -> Option[string],
+          eval: (string, *Out) -> Outcome) -> Ended
+    var ed = hosted_editor(c.line_cap, c.history_bytes, c.history_limit)
+    var t = unix_terminal()
+    val join: []u8 = [0; c.line_cap * 4]
+
+    if c.history_file.len > 0
+        load_history(&ed, c.history_file) match
+            Err(e) -> eprints(f"history: cannot read ${c.history_file}: $e\n")
+            Ok(_) -> ()
+
+    val ended = run_with(&ed, &t, join, c.prompts, complete, hint, eval)
+
+    if c.history_file.len > 0
+        save_history(&ed, c.history_file) match
+            Err(e) -> eprints(f"history: cannot write ${c.history_file}: $e\n")
+            Ok(_) -> ()
+
+    ended
+end repl_with

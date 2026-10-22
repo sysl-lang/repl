@@ -1,0 +1,42 @@
+module sh.sysl.repl
+@no_alloc
+
+/** A terminal, as little of one as a line editor can work with.
+ *
+ * **Five members, and none of them knows what a key is.** Decoding the bytes a keyboard sends into
+ * keys, and writing the sequences that move the cursor and clear the line, are the editor's job and
+ * live in this module once. A terminal only moves bytes and switches its own mode, which is what
+ * makes a new one a few lines: a UART is a `read_byte` that waits on the receive register and a
+ * `write` that feeds the transmit one, with both mode members doing nothing because a UART has no
+ * line discipline to switch off.
+ *
+ * Every member that can fail says so in its answer rather than by trapping. `read_byte` answering
+ * `None` is the end of the input -- a closed pipe, a dropped cable -- and the editor treats it as
+ * Ctrl-D would be treated; `write` answering `false` ends the line being read with `Read.Failed`.
+ */
+trait Terminal
+    /** The next byte of input, waiting for one. `None` when there will be no more. */
+    read_byte(*self) -> Option[u8]
+
+    /** Writes every byte, or answers `false`. */
+    @borrows(bytes)
+    write(*self, bytes: []const u8) -> bool
+
+    /** Pushes out anything held back. A terminal with no buffer answers `true` and does nothing. */
+    flush(*self) -> bool
+
+    /** Turns off whatever echoes and edits the input before this editor sees it. Answers whether it
+     * could; a terminal with no line discipline -- a UART -- has nothing to turn off and answers `true`.
+     */
+    enter_raw_mode(*self) -> bool
+
+    /** Puts back what `enter_raw_mode` changed. */
+    exit_raw_mode(*self)
+
+    /** How many columns the terminal is wide, or `0` when it cannot say -- the default, and the answer
+     * a serial line gives. The editor then uses its own `width`, 80 unless set.
+     *
+     * It is the one optional member, which is why it has a body here: a terminal that knows its width
+     * (a host's, through `TIOCGWINSZ`) says so, and every other terminal writes nothing.
+     */
+    columns(*self) -> usize = 0

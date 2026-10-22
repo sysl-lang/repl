@@ -1,0 +1,586 @@
+module sh.sysl.repl
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.str_builder
+
+// The editor, driven through a `MockTerminal`: a script of bytes in, and both halves of what an
+// editor does checked -- the line it answers and the bytes it wrote.
+//
+// **Most binding tests insert a marker after the key under test** and check where it landed: `abc`,
+// Left, Left, `X` answering `aXbc` says the cursor moved exactly two characters, which no assertion on
+// the answer alone could. The rendering tests assert the exact bytes of a redraw.
+
+private const esc: string = "\u{1b}"
+private const left: string = "\u{1b}[D"
+private const right: string = "\u{1b}[C"
+private const up: string = "\u{1b}[A"
+private const down: string = "\u{1b}[B"
+private const home: string = "\u{1b}[H"
+private const end_key: string = "\u{1b}[F"
+private const del: string = "\u{1b}[3~"
+private const ctrl_left: string = "\u{1b}[1;5D"
+private const ctrl_right: string = "\u{1b}[1;5C"
+private const ctrl_del: string = "\u{1b}[3;5~"
+private const alt_bs: string = "\u{1b}\u{7f}"
+
+/** An editor and a mock terminal over freshly allocated storage. */
+struct Rig
+    t: MockTerminal
+    ed: Editor
+
+private rig_of(input: []const u8, line_cap: usize, width: usize) -> Rig
+    val out: []u8 = [0; 65536]
+    val line: []u8 = [0; line_cap]
+    val draft: []u8 = [0; line_cap]
+    val store: []u8 = [0; 256]
+    var t = mock_terminal(input, out)
+
+    t.width = width
+    Rig(t, editor(line, draft, store, 8))
+end rig_of
+
+private rig(input: string) -> Rig = rig_of(input.bytes, 64, 0)
+
+/** Every `read_line` until the input ends, each answer joined with `|`. */
+private outcomes(r: *Rig) -> string = outcomes_with(r, no_completion, no_hint)
+
+private outcomes_with(r: *Rig, complete: (string, usize) -> Option[string],
+                      hint: string -> Option[string]) -> string
+    var s = str_builder()
+
+    loop
+        if s.len > 0 then s.push("|")
+
+        r.ed.read_line_with(&r.t, "> ", complete, hint) match
+            Line(text) -> s.push(text)
+            Interrupted -> s.push("^C")
+            Eof ->
+                s.push("EOF")
+                break
+            Failed ->
+                s.push("FAILED")
+                break
+
+    s.finish()
+end outcomes_with
+
+private lines_of(input: string) -> string
+    var r = rig(input)
+
+    outcomes(&r)
+
+private lines_of_bytes(input: []const u8) -> string
+    var r = rig_of(input, 64, 0)
+
+    outcomes(&r)
+
+/** What the terminal was told, for a script. */
+private drawn(input: string, width: usize) -> string
+    var r = rig_of(input.bytes, 64, width)
+
+    outcomes(&r)
+    r.t.text().copy()
+
+private words(word: string, i: usize) -> Option[string]
+    val all = ["help", "hello", "history", "say"]
+    var seen: usize = 0
+
+    for w in all
+        if w.starts_with(word)
+            if seen == i then return Some(w)
+
+            seen += 1
+
+    None
+end words
+
+// -- ending a line ----------------------------------------------------------------------------------
+
+@test("CR ends a line, and the input running out answers EOF")
+cr_ends_a_line()
+    assert_eq(lines_of("ab\r"), "ab|EOF")
+
+@test("LF ends a line too, and CRLF is one ending rather than two")
+crlf_is_one_ending()
+    assert_eq(lines_of("a\r\nb\nc\r"), "a|b|c|EOF")
+
+@test("text before the input runs out is still a line")
+text_then_end_of_input()
+    assert_eq(lines_of("abc"), "abc|EOF")
+
+@test("Enter is followed by CRLF, which is what an embedded terminal needs")
+enter_writes_crlf()
+    assert(drawn("a\r", 0).contains("\r> a\u{1b}[0K\r\u{1b}[3C\r\n\r> "))
+
+@test("raw mode is entered for each line and left after it")
+raw_mode_per_line()
+    var r = rig("a\rb\r")
+
+    outcomes(&r)
+    assert_eq(r.t.entered, 3)
+    assert_eq(r.t.exited, 3)
+    assert(!r.t.raw)
+
+// -- moving -----------------------------------------------------------------------------------------
+
+@test("Left moves back one character")
+left_arrow()
+    assert_eq(lines_of("abc" + left + left + "X\r"), "aXbc|EOF")
+
+@test("Right moves forward one character")
+right_arrow()
+    assert_eq(lines_of("abc" + home + right + "X\r"), "aXbc|EOF")
+
+@test("the SS3 arrows and Ctrl-B / Ctrl-F move the same way")
+other_arrow_spellings()
+    assert_eq(lines_of("abc\u{1b}OD\u{1b}OD\u{1b}OCX\r"), "abXc|EOF")
+    assert_eq(lines_of("abc\u{2}\u{2}\u{6}X\r"), "abXc|EOF")
+
+@test("Left at the start and Right at the end ring the bell and change nothing")
+arrows_at_the_edges()
+    assert_eq(lines_of(left + "a" + right + "\r"), "a|EOF")
+    assert(drawn(left + "\r", 0).contains("\u{7}"))
+
+@test("Home, in every spelling, goes to the start")
+home_spellings()
+    for h in [home, "\u{1b}OH", "\u{1b}[1~", "\u{1b}[7~", "\u{1}"]
+        assert_eq(lines_of("abc" + h + "X\r"), "Xabc|EOF", h)
+
+@test("End, in every spelling, goes to the end")
+end_spellings()
+    for e in [end_key, "\u{1b}OF", "\u{1b}[4~", "\u{1b}[8~", "\u{5}"]
+        assert_eq(lines_of("abc" + home + e + "X\r"), "abcX|EOF", e)
+
+@test("Ctrl-Left, Alt-Left and Alt-b move back a word")
+word_left_spellings()
+    for k in [ctrl_left, "\u{1b}[1;3D", "\u{1b}b"]
+        assert_eq(lines_of("foo bar" + k + "X\r"), "foo Xbar|EOF", k)
+
+@test("Ctrl-Right, Alt-Right and Alt-f move forward a word, past the blanks after it")
+word_right_spellings()
+    for k in [ctrl_right, "\u{1b}[1;3C", "\u{1b}f"]
+        assert_eq(lines_of("foo  bar" + home + k + "X\r"), "foo  Xbar|EOF", k)
+
+@test("a symbol is a word of its own, so moving through an expression stops at each operator")
+symbols_are_words()
+    assert_eq(lines_of("x+=y-1" + ctrl_left + "X\r"), "x+=y-X1|EOF")
+    assert_eq(lines_of("x+=y-1" + ctrl_left + ctrl_left + "X\r"), "x+=yX-1|EOF")
+    assert_eq(lines_of("x+=y-1" + ctrl_left + ctrl_left + ctrl_left + ctrl_left + "X\r"), "xX+=y-1|EOF")
+    assert_eq(lines_of("x+=y-1" + home + ctrl_right + "X\r"), "xX+=y-1|EOF")
+    assert_eq(lines_of("x+=y-1" + home + ctrl_right + ctrl_right + "X\r"), "x+=Xy-1|EOF")
+
+// -- deleting ---------------------------------------------------------------------------------------
+
+@test("Backspace, as DEL or as BS, deletes the character before the cursor")
+backspace()
+    assert_eq(lines_of("abc\u{7f}\r"), "ab|EOF")
+    assert_eq(lines_of("abc\u{8}\u{8}\r"), "a|EOF")
+    assert_eq(lines_of("abc" + left + "\u{7f}\r"), "ac|EOF")
+
+@test("Delete removes the character under the cursor")
+delete_key()
+    assert_eq(lines_of("abc" + home + del + "\r"), "bc|EOF")
+    assert_eq(lines_of("abc" + del + "\r"), "abc|EOF")
+
+@test("Ctrl-D on a line with text deletes under the cursor rather than ending the input")
+ctrl_d_mid_line()
+    assert_eq(lines_of("abc" + home + "\u{4}\r"), "bc|EOF")
+
+@test("Alt-Backspace and Ctrl-W delete the word before the cursor")
+delete_word_left()
+    assert_eq(lines_of("foo bar" + alt_bs + "\r"), "foo |EOF")
+    assert_eq(lines_of("foo bar\u{1b}\u{8}\r"), "foo |EOF")
+    assert_eq(lines_of("foo bar\u{17}\r"), "foo |EOF")
+    assert_eq(lines_of("a+b" + alt_bs + alt_bs + "\r"), "a|EOF")
+
+@test("Ctrl-Delete, Alt-Delete and Alt-d delete the word after the cursor")
+delete_word_right()
+    for k in [ctrl_del, "\u{1b}[3;3~", "\u{1b}d"]
+        assert_eq(lines_of("foo bar" + home + k + "\r"), "bar|EOF", k)
+
+@test("Ctrl-K kills to the end and Ctrl-U to the start")
+kills()
+    assert_eq(lines_of("abcd" + left + left + "\u{b}\r"), "ab|EOF")
+    assert_eq(lines_of("abcd" + left + left + "\u{15}\r"), "cd|EOF")
+
+// -- what is not a key ------------------------------------------------------------------------------
+
+@test("a sequence that names no key is read to its end and dropped")
+unknown_sequences_are_dropped()
+    assert_eq(lines_of("a\u{1b}[5~b\u{1b}[1;2Pc\u{1b}[?25hd\r"), "abcd|EOF")
+
+@test("a control byte that names no key is ignored, and so is ESC before an ordinary letter")
+unknown_bytes_are_ignored()
+    assert_eq(lines_of("a\u{7}\u{0}b\u{1b}zc\r"), "abc|EOF")
+
+@test("Ctrl-L clears the screen and draws the line again")
+ctrl_l()
+    assert(drawn("ab\u{c}\r", 0).contains("\u{1b}[H\u{1b}[2J\r> ab"))
+
+// -- interrupt and end of input ---------------------------------------------------------------------
+
+@test("Ctrl-C abandons the line, prints ^C, and the next line is read as usual")
+ctrl_c()
+    assert_eq(lines_of("abc\u{3}x\r"), "^C|x|EOF")
+    assert(drawn("abc\u{3}", 0).contains("abc\u{1b}[0K\r\u{1b}[5C^C\r\n"))
+
+@test("Ctrl-D on an empty line ends the input, and nothing after it is read")
+ctrl_d_on_an_empty_line()
+    var r = rig("\u{4}abc\r")
+
+    assert_eq(outcomes(&r), "EOF")
+    assert_eq(r.t.read_at, 1)
+
+@test("the input ending in the middle of an escape sequence is the end of the input")
+eof_mid_escape()
+    assert_eq(lines_of("\u{1b}"), "EOF")
+    assert_eq(lines_of("\u{1b}["), "EOF")
+    assert_eq(lines_of("\u{1b}[1;"), "EOF")
+    assert_eq(lines_of("ab\u{1b}[3"), "ab|EOF")
+
+@test("the input ending in the middle of a character is the end of the input")
+eof_mid_character()
+    val bytes: [3]u8 = [u8('a'), 0xe6, 0x97]
+
+    assert_eq(lines_of_bytes(bytes), "a|EOF")
+
+// -- UTF-8 ------------------------------------------------------------------------------------------
+
+@test("multibyte characters are inserted whole and answered as text")
+multibyte_insert()
+    assert_eq(lines_of("héllo 日本\r"), "héllo 日本|EOF")
+
+@test("the cursor steps over a multibyte character as one")
+multibyte_moves()
+    assert_eq(lines_of("a日b" + left + left + "X\r"), "aX日b|EOF")
+    assert_eq(lines_of("a😀b" + home + right + right + "X\r"), "a😀Xb|EOF")
+
+@test("Backspace and Delete remove a whole multibyte character")
+multibyte_deletes()
+    assert_eq(lines_of("a日\u{7f}\r"), "a|EOF")
+    assert_eq(lines_of("😀b" + home + del + "\r"), "b|EOF")
+
+@test("a word may be made of characters beyond ASCII")
+multibyte_words()
+    assert_eq(lines_of("naïve 日本語" + ctrl_left + ctrl_left + "X\r"), "Xnaïve 日本語|EOF")
+
+@test("bytes that are not UTF-8 arrive as U+FFFD, so the line is always text")
+malformed_bytes()
+    val lone: [3]u8 = [0xff, 0x0d, 0x0d]
+    val broken: [3]u8 = [0xe6, u8('a'), 0x0d]
+    val overlong: [3]u8 = [0xc0, 0x80, 0x0d]
+
+    assert_eq(lines_of_bytes(lone[0..<2]), "\u{FFFD}|EOF")
+    assert_eq(lines_of_bytes(broken), "\u{FFFD}|EOF")
+    assert_eq(lines_of_bytes(overlong), "\u{FFFD}|EOF")
+
+// -- a full buffer ----------------------------------------------------------------------------------
+
+@test("a keystroke that would overflow the line is refused with the bell")
+full_line_buffer()
+    var r = rig_of("abcdef\r".bytes, 4, 0)
+
+    assert_eq(outcomes(&r), "abcd|EOF")
+    assert(r.t.text().contains("\u{7}"))
+
+@test("a multibyte character that does not fit is refused whole, never split")
+full_buffer_multibyte()
+    var r = rig_of("abcé\r".bytes, 4, 0)
+
+    assert_eq(outcomes(&r), "abc|EOF")
+
+// -- a write that fails -----------------------------------------------------------------------------
+
+@test("a terminal that refuses its first write fails the read, and raw mode is still left")
+write_fails_at_once()
+    var r = rig("abc\r")
+
+    r.t.writes_left = Some(0)
+    assert_eq(outcomes(&r), "FAILED")
+    assert_eq(r.t.exited, r.t.entered)
+
+@test("a write failing part way through a line fails the read")
+write_fails_later()
+    var r = rig("abcdef\r")
+
+    r.t.writes_left = Some(12)
+    assert_eq(outcomes(&r), "FAILED")
+    assert(r.t.read_at < 7)
+
+@test("output overflowing the terminal is a failed write too")
+output_full()
+    val out: []u8 = [0; 8]
+    val line: []u8 = [0; 16]
+    val draft: []u8 = [0; 16]
+    val store: []u8 = [0; 16]
+    var t = mock_terminal("abcdef\r".bytes, out)
+    var ed = editor(line, draft, store, 2)
+
+    val failed = ed.read_line(&t, "> ") match
+        Failed -> true
+        _ -> false
+
+    assert(failed)
+
+// -- the history through the keys -------------------------------------------------------------------
+
+@test("Up recalls the previous line, and again the one before it")
+up_recalls()
+    assert_eq(lines_of("one\rtwo\r" + up + "\r"), "one|two|two|EOF")
+    assert_eq(lines_of("one\rtwo\r" + up + up + "\r"), "one|two|one|EOF")
+    assert_eq(lines_of("one\rtwo\r\u{10}\u{10}\r"), "one|two|one|EOF")
+
+@test("Up past the oldest entry stays on it and rings")
+up_past_the_oldest()
+    assert_eq(lines_of("one\r" + up + up + up + "\r"), "one|one|EOF")
+    assert(drawn(up + "\r", 0).contains("\u{7}"))
+
+@test("Down walks forward, and past the newest gives back what was being typed")
+down_restores_the_draft()
+    assert_eq(lines_of("one\rtwo\rdr" + up + up + down + "\r"), "one|two|two|EOF")
+    assert_eq(lines_of("one\rtwo\rdr" + up + up + down + down + "\r"), "one|two|dr|EOF")
+    assert_eq(lines_of("one\rdr\u{10}\u{e}\r"), "one|dr|EOF")
+
+@test("a recalled line can be edited before it is entered")
+edit_a_recalled_line()
+    assert_eq(lines_of("echo hi\r" + up + alt_bs + "yo\r"), "echo hi|echo yo|EOF")
+
+@test("Down with nothing browsed does nothing")
+down_alone()
+    assert_eq(lines_of("ab" + down + "\r"), "ab|EOF")
+
+// -- the history itself -----------------------------------------------------------------------------
+
+private fresh_history(bytes: usize, limit: usize) -> History
+    val store: []u8 = [0; bytes]
+
+    history(store, limit)
+
+@test("a blank line is not recorded, nor is one of only spaces and tabs")
+history_skips_blank()
+    var h = fresh_history(64, 8)
+
+    assert(!h.add(""))
+    assert(!h.add("   \t "))
+    assert(h.is_empty())
+
+@test("a line equal to the newest entry is not recorded again, after trimming")
+history_skips_duplicates()
+    var h = fresh_history(64, 8)
+
+    assert(h.add("ls"))
+    assert(!h.add("ls"))
+    assert(!h.add("  ls "))
+    assert_eq(h.len(), 1)
+
+@test("a repeat of an older entry is recorded: only the newest is compared")
+history_keeps_older_repeats()
+    var h = fresh_history(64, 8)
+
+    h.add("a")
+    h.add("b")
+    assert(h.add("a"))
+    assert_eq(h.len(), 3)
+    assert_eq(h.newest(0), "a")
+    assert_eq(h.get(0), "a")
+
+@test("an entry is stored trimmed")
+history_trims()
+    var h = fresh_history(64, 8)
+
+    h.add("  ls -l \r\n")
+    assert_eq(h.get(0), "ls -l")
+
+@test("at the entry limit the oldest goes")
+history_wraps_at_the_limit()
+    var h = fresh_history(256, 3)
+
+    for s in ["1", "2", "3", "4", "5"] do h.add(s)
+
+    assert_eq(h.len(), 3)
+    assert_eq(h.get(0), "3")
+    assert_eq(h.get(2), "5")
+
+@test("when the bytes run out the oldest go until the new entry fits")
+history_wraps_at_the_store()
+    var h = fresh_history(10, 8)
+
+    h.add("abc")
+    h.add("def")
+    assert_eq(h.len(), 2)
+
+    h.add("gh")
+    assert_eq(h.len(), 2)
+    assert_eq(h.get(0), "def")
+    assert_eq(h.get(1), "gh")
+
+    h.add("12345678")
+    assert_eq(h.len(), 1)
+    assert_eq(h.get(0), "12345678")
+
+@test("an entry longer than the whole store is refused and the history is unchanged")
+history_entry_too_long()
+    var h = fresh_history(6, 8)
+
+    h.add("ab")
+    assert(!h.add("abcde"))
+    assert_eq(h.len(), 1)
+    assert_eq(h.get(0), "ab")
+
+@test("a history with a limit of zero records nothing")
+history_limit_zero()
+    var h = fresh_history(64, 0)
+
+    assert(!h.add("a"))
+
+@test("Up reaches only the entries the limit kept")
+up_after_wrapping()
+    var r = rig("1\r2\r3\r4\r5\r6\r7\r8\r9\r" + up + up + up + up + up + up + up + up + up + "\r")
+
+    // The rig keeps eight entries, so nine Ups stop at the oldest kept, `2`.
+    assert(outcomes(&r).ends_with("|9|2|EOF"))
+
+@test("clear empties the history")
+history_clear()
+    var h = fresh_history(64, 8)
+
+    h.add("a")
+    h.clear()
+    assert(h.is_empty())
+    assert(h.add("a"))
+
+// -- drawing ----------------------------------------------------------------------------------------
+
+@test("each keystroke redraws the row: CR, prompt, text, clear to the end, cursor placed")
+redraw_bytes()
+    assert_eq(drawn("ab\r", 0),
+              "\r> \u{1b}[0K\r\u{1b}[2C" +
+              "\r> a\u{1b}[0K\r\u{1b}[3C" +
+              "\r> ab\u{1b}[0K\r\u{1b}[4C" +
+              "\r> ab\u{1b}[0K\r\u{1b}[4C\r\n" +
+              // The second read, which finds the input ended.
+              "\r> \u{1b}[0K\r\u{1b}[2C")
+
+@test("the cursor column counts what is before it, not the whole line")
+redraw_cursor_in_the_middle()
+    assert(drawn("abc" + left + "\r", 0).contains("\r> abc\u{1b}[0K\r\u{1b}[4C"))
+
+@test("a line wider than the terminal scrolls to keep the cursor in view")
+horizontal_scroll()
+    // Ten columns, a prompt of two, one kept for the cursor: seven of text.
+    val out = drawn("abcdefghij" + home + "\r", 10)
+
+    assert(out.contains("\r> defghij\u{1b}[0K\r\u{1b}[9C"))
+    assert(out.contains("\r> abcdefg\u{1b}[0K\r\u{1b}[2C"))
+
+@test("scrolling back left follows the cursor one character at a time")
+horizontal_scroll_back()
+    val out = drawn("abcdefghij" + home + end_key + left + left + left + left + left + left + left + left + "\r", 10)
+
+    // From the end, eight Lefts take the cursor to `c`, which is where the row must start.
+    assert(out.contains("\r> cdefghi\u{1b}[0K\r\u{1b}[2C"))
+
+@test("a wide character takes two columns, and scrolling never splits one")
+wide_characters()
+    assert(drawn("日本語日本\r", 10).contains("\r> 語日本\u{1b}[0K\r\u{1b}[8C"))
+
+@test("the editor's own width is used when the terminal cannot say")
+fallback_width()
+    var r = rig("abcdefghij\r")
+
+    r.ed.width = 10
+    outcomes(&r)
+    assert(r.t.text().contains("\r> defghij\u{1b}[0K\r\u{1b}[9C"))
+
+@test("the terminal's width wins over the editor's")
+terminal_width_wins()
+    var r = rig_of("abcdefghij\r".bytes, 64, 80)
+
+    r.ed.width = 10
+    outcomes(&r)
+    assert(r.t.text().contains("\r> abcdefghij\u{1b}[0K\r\u{1b}[12C"))
+
+// -- completion -------------------------------------------------------------------------------------
+
+private complete_lines(input: string) -> string
+    var r = rig(input)
+
+    outcomes_with(&r, words, no_hint)
+
+private complete_drawn(input: string) -> string
+    var r = rig(input)
+
+    outcomes_with(&r, words, no_hint)
+    r.t.text().copy()
+
+@test("Tab with one candidate makes the word that candidate")
+complete_one()
+    assert_eq(complete_lines("his\t\r"), "history|EOF")
+    assert_eq(complete_lines("echo s\t\r"), "echo say|EOF")
+
+@test("Tab with several candidates grows the word to what they share")
+complete_several_grows()
+    assert_eq(complete_lines("h\t\r"), "h|EOF")
+    assert_eq(complete_lines("he\t\r"), "hel|EOF")
+
+@test("Tab with several that cannot grow lists them under the line and draws the line again")
+complete_several_lists()
+    val out = complete_drawn("hel\t\r")
+
+    assert(out.contains("\r\nhelp  hello\r\n\r> hel\u{1b}[0K"))
+    assert_eq(complete_lines("hel\t\r"), "hel|EOF")
+
+@test("Tab with no candidate rings and changes nothing")
+complete_none()
+    assert_eq(complete_lines("zz\t\r"), "zz|EOF")
+    assert(complete_drawn("zz\t\r").contains("\u{7}"))
+
+@test("the word completed is the one before the cursor, even mid-line")
+complete_mid_line()
+    assert_eq(complete_lines("his x" + left + left + "\t\r"), "history x|EOF")
+
+@test("a completion that would not fit the line is refused with the bell")
+complete_too_long()
+    var r = rig_of("hi\t\r".bytes, 4, 0)
+
+    assert_eq(outcomes_with(&r, words, no_hint), "hi|EOF")
+    assert(r.t.text().contains("\u{7}"))
+
+@test("Tab with no completer rings")
+complete_absent()
+    assert(drawn("a\t\r", 0).contains("\u{7}"))
+
+// -- hints ------------------------------------------------------------------------------------------
+
+private rest_of_word(line: string) -> Option[string]
+    if line == "he" then Some("llo") else None
+
+private hinted(input: string, width: usize) -> string
+    var r = rig_of(input.bytes, 64, width)
+
+    outcomes_with(&r, no_completion, rest_of_word)
+    r.t.text().copy()
+
+@test("a hint is drawn dimmed after the line and is not part of it")
+hint_drawn()
+    val out = hinted("he\r", 0)
+
+    assert(out.contains("\r> he\u{1b}[2mllo\u{1b}[0m\u{1b}[0K\r\u{1b}[4C"))
+
+    var r = rig("he\r")
+
+    assert_eq(outcomes_with(&r, no_completion, rest_of_word), "he|EOF")
+
+@test("Enter draws the line once more without its hint")
+hint_gone_on_enter()
+    assert(hinted("he\r", 0).contains("\u{1b}[0m\u{1b}[0K\r\u{1b}[4C\r> he\u{1b}[0K\r\u{1b}[4C\r\n"))
+
+@test("no hint is drawn while the cursor is inside the line")
+hint_only_at_the_end()
+    assert(hinted("he" + left + "\r", 0).contains("\u{1b}[4C\r> he\u{1b}[0K\r\u{1b}[3C"))
+
+@test("a hint is cut to the columns that are left")
+hint_truncated()
+    // Seven columns, a prompt of two, one for the cursor: four left, two of them taken by `he`.
+    assert(hinted("he\r", 7).contains("\r> he\u{1b}[2mll\u{1b}[0m\u{1b}[0K"))

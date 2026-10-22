@@ -1,0 +1,462 @@
+module sh.sysl.repl
+@no_alloc
+
+import sysl.math.{max, min}
+import sysl.text.{char_columns, char_from_u32, str_view}
+
+/** How a `read_line` ended. */
+enum Read
+    /** Enter was pressed, or the input ended after some text. The text shares the editor's storage
+     * and is valid until the next `read_line`.
+     */
+    Line(text: string)
+    /** Ctrl-C: the line was abandoned. */
+    Interrupted
+    /** Ctrl-D on an empty line, or the input ended with nothing typed. */
+    Eof
+    /** The terminal refused a write. */
+    Failed
+end Read
+
+/** The fallback width, for a terminal that cannot say how wide it is. */
+const default_width: usize = 80
+
+/** The most candidates one Tab asks the completer for -- a guard against one that never answers
+ * `None`, not a limit anybody should meet.
+ */
+const max_candidates: usize = 256
+
+/** The escape sequences the editor writes, which the tests assert byte for byte. */
+private const clear_to_eol: string = "\u{1b}[0K"
+private const dim: string = "\u{1b}[2m"
+private const undim: string = "\u{1b}[0m"
+private const clear_screen: string = "\u{1b}[H\u{1b}[2J"
+private const bell: string = "\u{7}"
+
+/** A line editor: one line, its history, and how it is drawn.
+ *
+ * **It owns no storage.** The line, the draft that Up saves and Down restores, and the history are all
+ * slices handed to `editor`, so the same editor runs on a board with module-level arrays and on a host
+ * with allocated ones (`sh.sysl.repl.host.hosted_editor`).
+ *
+ * **It draws one row, and scrolls it sideways.** A line wider than the terminal shows the part around
+ * the cursor; every keystroke redraws the row from column zero -- prompt, visible text, a hint, a
+ * clear to the end of the row -- and then puts the cursor where it belongs. Redrawing the whole row
+ * rather than patching it is what keeps the arithmetic in one place, and a row is at most a few
+ * hundred bytes even over a slow serial line.
+ */
+struct Editor
+    line: LineBuffer
+    draft: []u8
+    draft_len: usize
+    history: History
+    keys: KeyReader
+    /** The width used when the terminal's `columns` answers 0. */
+    width: usize
+    // The first byte of the line on screen, when it is scrolled.
+    scroll: usize
+    // How far back in the history Up has gone; 0 is the line being typed.
+    back: usize
+    // A write failed during this line.
+    failed: bool
+    /** Whether a line read is added to `history` as it is answered -- `true` unless set. The REPL
+     * loop turns it off and records each whole input itself, so a continued input is one entry.
+     */
+    records: bool
+
+    /** Reads one line with no completion and no hints. */
+    read_line(*self, t: *Terminal, prompt: string) -> Read =
+        self.read_line_with(t, prompt, no_completion, no_hint)
+
+    /** Reads one line, with Tab asking `complete` and the row showing what `hint` suggests.
+     *
+     * `complete(word, i)` answers the `i`th candidate for the word before the cursor -- the run of
+     * non-blank characters ending there -- or `None` when there are no more; it is asked for 0, 1, 2
+     * … in turn. A candidate replaces the whole word. **What Tab does:**
+     *
+     * - no candidate: the terminal's bell;
+     * - one: the word becomes it;
+     * - several: the word grows to their longest common prefix, and when it cannot grow, the candidates
+     *   are listed on the rows below and the line is drawn again under them.
+     *
+     * `hint(line)` is asked while the cursor is at the end of the line, and what it answers is drawn
+     * dimmed after the cursor. It is never inserted.
+     *
+     * The terminal is put into raw mode for the line and back afterwards, so whatever the caller does
+     * between lines runs in the terminal's ordinary mode.
+     */
+    read_line_with(*self, t: *Terminal, prompt: string, complete: (string, usize) -> Option[string],
+                   hint: string -> Option[string]) -> Read
+        val raw = t.enter_raw_mode()
+        val answer = self.edit(t, prompt, complete, hint)
+
+        if raw then t.exit_raw_mode()
+
+        answer
+    end read_line_with
+
+    private edit(*self, t: *Terminal, prompt: string, complete: (string, usize) -> Option[string],
+                 hint: string -> Option[string]) -> Read
+        self.line.clear()
+        self.scroll = 0
+        self.back = 0
+        self.failed = false
+
+        self.refresh(t, prompt, hint, true)
+
+        loop
+            if self.failed then return Failed
+
+            val key = self.keys.next(t)
+
+            key match
+                Enter -> return self.finish(t, prompt)
+
+                Interrupt ->
+                    self.line.to_end()
+                    self.refresh(t, prompt, hint, false)
+                    self.put(t, "^C\r\n")
+                    self.flush(t)
+                    return if self.failed then Failed else Interrupted
+
+                EndOfInput ->
+                    if self.line.is_empty()
+                        self.put(t, "\r\n")
+                        self.flush(t)
+                        return if self.failed then Failed else Eof
+
+                    if self.line.delete() then self.refresh(t, prompt, hint, true)
+
+                Eof ->
+                    if self.line.is_empty() then return Eof
+
+                    return self.finish(t, prompt)
+
+                Tab -> self.complete(t, prompt, complete, hint)
+
+                ClearScreen ->
+                    self.put(t, clear_screen)
+                    self.refresh(t, prompt, hint, true)
+
+                Ignored -> ()
+
+                _ ->
+                    val changed = key match
+                        Up -> self.earlier()
+                        Down -> self.later()
+                        _ -> self.apply(key)
+
+                    if changed then self.refresh(t, prompt, hint, true)
+                    else
+                        self.put(t, bell)
+                        self.flush(t)
+    end edit
+
+    /** The keys that only change the line. Answers whether anything changed. */
+    private apply(*self, key: Key) -> bool = key match
+        Char(c)         -> self.line.insert(c)
+        Backspace       -> self.line.backspace()
+        Delete          -> self.line.delete()
+        Left            -> self.line.left()
+        Right           -> self.line.right()
+        Home            -> self.line.to_start()
+        End             -> self.line.to_end()
+        WordLeft        -> self.line.word_left()
+        WordRight       -> self.line.word_right()
+        DeleteWordLeft  -> self.line.delete_word_left()
+        DeleteWordRight -> self.line.delete_word_right()
+        KillToEnd       -> self.line.kill_to_end()
+        KillToStart     -> self.line.kill_to_start()
+        _               -> false
+
+    /** The line is done: drawn once more without its hint, with the cursor at the end, and the cursor
+     * taken to the start of the next row. Recorded in the history when `records` is on.
+     */
+    private finish(*self, t: *Terminal, prompt: string) -> Read
+        self.line.to_end()
+        self.refresh(t, prompt, no_hint, false)
+        self.put(t, "\r\n")
+        self.flush(t)
+
+        if self.failed then return Failed
+        if self.records then self.history.add(self.line.text())
+
+        Line(self.line.text())
+    end finish
+
+    // ## History
+
+    /** Up: one entry further back, saving what was being typed on the first step. */
+    private earlier(*self) -> bool
+        if self.back >= self.history.len() then return false
+
+        if self.back == 0
+            val n = min(self.line.len, self.draft.len)
+
+            for k in 0..<n do self.draft[k] = self.line.bytes[k]
+
+            self.draft_len = n
+
+        self.back += 1
+        self.line.load(self.history.newest(self.back - 1).bytes)
+        true
+    end earlier
+
+    /** Down: one entry nearer, and the saved line again after the newest. */
+    private later(*self) -> bool
+        if self.back == 0 then return false
+
+        self.back -= 1
+
+        if self.back == 0 then self.line.load(self.draft[0..<self.draft_len])
+        else self.line.load(self.history.newest(self.back - 1).bytes)
+
+        true
+    end later
+
+    // ## Completion
+
+    private complete(*self, t: *Terminal, prompt: string, complete: (string, usize) -> Option[string],
+                     hint: string -> Option[string])
+        val start = self.word_start()
+        val word = str_view(self.line.bytes[start..<self.line.at])
+
+        var count: usize = 0
+        var first = ""
+        var common: usize = 0
+
+        while count < max_candidates
+            val c = complete(word, count) match
+                Some(c) -> c
+                None -> break
+
+            if count == 0
+                first = c
+                common = c.len
+            else
+                common = shared_prefix(first, c, common)
+
+            count += 1
+
+        if count == 0
+            self.put(t, bell)
+        elif count == 1
+            self.replace_word(t, start, first)
+        elif common > word.len && first[0..<common].starts_with(word)
+            self.replace_word(t, start, first[0..<common])
+        else
+            self.put(t, "\r\n")
+
+            for i in 0..<count
+                if i > 0 then self.put(t, "  ")
+
+                complete(word, i) match
+                    Some(c) -> self.put(t, c)
+                    None -> ()
+
+            self.put(t, "\r\n")
+
+        self.refresh(t, prompt, hint, true)
+    end complete
+
+    /** The start of the run of non-blank characters that ends at the cursor. */
+    private word_start(self) -> usize
+        var i = self.line.at
+
+        while i > 0
+            val j = self.line.prev(i)
+            val b = self.line.bytes[j]
+
+            if b == u8(' ') || b == u8('\t') then break
+
+            i = j
+
+        i
+    end word_start
+
+    /** Replaces the bytes from `start` to the cursor with `text`, or rings when it will not fit. */
+    private replace_word(*self, t: *Terminal, start: usize, text: string)
+        val word = self.line.at - start
+
+        if self.line.len - word + text.len > self.line.capacity()
+            self.put(t, bell)
+            return
+
+        while self.line.at > start do self.line.backspace()
+
+        self.line.insert_text(text)
+    end replace_word
+
+    // ## Drawing
+
+    /** Draws the row: carriage return, prompt, the visible part of the line, a hint when the cursor is
+     * at the end and `with_hint` allows it, a clear to the end of the row, and the cursor put back.
+     */
+    private refresh(*self, t: *Terminal, prompt: string, hint: string -> Option[string], with_hint: bool)
+        val cols = t.columns() match
+            0 -> max(self.width, 1)
+            n -> n
+
+        val prompt_cols = columns_of(prompt.bytes)
+        // One column is kept free for the cursor to sit in at the end of the row.
+        val room = if cols > prompt_cols + 1 then cols - prompt_cols - 1 else 1
+        val b = self.line.bytes
+
+        // Scroll left to reach the cursor, or right until it is on screen.
+        if self.line.at < self.scroll then self.scroll = self.line.at
+
+        while columns_of(b[self.scroll..<self.line.at]) > room do self.scroll = self.line.next(self.scroll)
+
+        // Then as many characters as fit, from where the row starts.
+        var stop = self.scroll
+        var used: usize = 0
+
+        while stop < self.line.len
+            val w = char_columns(char_at(b, stop))
+
+            if used + w > room then break
+
+            used += w
+            stop = self.line.next(stop)
+
+        self.put(t, "\r")
+        self.put(t, prompt)
+        self.put_bytes(t, b[self.scroll..<stop])
+
+        if with_hint && self.line.at_end() && stop == self.line.len
+            hint(self.line.text()) match
+                Some(h) -> self.put_hint(t, h, room - used)
+                None -> ()
+
+        self.put(t, clear_to_eol)
+        self.put(t, "\r")
+
+        val cursor = prompt_cols + columns_of(b[self.scroll..<self.line.at])
+
+        if cursor > 0 then self.put_forward(t, cursor)
+
+        self.flush(t)
+    end refresh
+
+    /** As much of `h` as fits in `room` columns, dimmed. */
+    private put_hint(*self, t: *Terminal, h: string, room: usize)
+        var stop: usize = 0
+        var used: usize = 0
+
+        while stop < h.len
+            val w = char_columns(char_at(h.bytes, stop))
+
+            if used + w > room then break
+
+            used += w
+            stop += 1
+
+            while stop < h.len && !boundary(h.bytes[stop]) do stop += 1
+
+        if stop == 0 then return
+
+        self.put(t, dim)
+        self.put_bytes(t, h.bytes[0..<stop])
+        self.put(t, undim)
+    end put_hint
+
+    /** `ESC [ n C`: the cursor `n` columns right. */
+    private put_forward(*self, t: *Terminal, n: usize)
+        var digits: [20]u8 = [0; 20]
+        var i = digits.len
+        var v = n
+
+        loop
+            i -= 1
+            digits[i] = u8('0') + u8(v % 10)
+            v /= 10
+
+            if v == 0 then break
+
+        self.put(t, "\u{1b}[")
+        self.put_bytes(t, digits[i..<digits.len])
+        self.put(t, "C")
+    end put_forward
+
+    private put(*self, t: *Terminal, s: string) = self.put_bytes(t, s.bytes)
+
+    private put_bytes(*self, t: *Terminal, bytes: []const u8)
+        if self.failed || bytes.len == 0 then return
+        if !t.write(bytes) then self.failed = true
+
+    private flush(*self, t: *Terminal)
+        if !self.failed && !t.flush() then self.failed = true
+end Editor
+
+/** An editor over caller-owned storage: `line` holds the line being typed and is its capacity, `draft`
+ * keeps that line while Up browses the history (the same size as `line`, or what does not fit is
+ * cut), and `history` is the history's store, holding at most `limit` entries.
+ *
+ * No allocation is made, here or by anything the editor does, so `line`, `draft` and `history` may be
+ * module-level arrays on a target with no heap:
+ *
+ *     var line_store: [256]u8 = [0; 256]
+ *     var draft_store: [256]u8 = [0; 256]
+ *     var history_store: [2048]u8 = [0; 2048]
+ *
+ *     var ed = editor(line_store, draft_store, history_store, 32)
+ */
+editor(line: []u8, draft: []u8, history_store: []u8, limit: usize) -> Editor =
+    Editor(line_buffer(line), draft, 0, history(history_store, limit), key_reader(), default_width, 0, 0,
+           false, true)
+
+/** The completer that offers nothing, for `read_line_with` when only a hint is wanted. */
+no_completion(word: string, i: usize) -> Option[string] = None
+
+/** The hint function that suggests nothing. */
+no_hint(line: string) -> Option[string] = None
+
+/** How many columns some UTF-8 takes on screen. */
+private[repl] columns_of(b: []const u8) -> usize
+    var n: usize = 0
+    var i: usize = 0
+
+    while i < b.len
+        n += char_columns(char_at(b, i))
+        i += 1
+
+        while i < b.len && !boundary(b[i]) do i += 1
+
+    n
+end columns_of
+
+/** The character that starts at byte `i` of valid UTF-8. */
+private[repl] char_at(b: []const u8, i: usize) -> char
+    val b0 = b[i]
+
+    if b0 < 128 then return char(uint(b0))
+
+    var u: u32 = 0
+    var more: usize = 0
+
+    if b0 & 224 == 192
+        u = u32(b0 & 31)
+        more = 1
+    elif b0 & 240 == 224
+        u = u32(b0 & 15)
+        more = 2
+    else
+        u = u32(b0 & 7)
+        more = 3
+
+    for k in 1..more do u = (u << 6) | u32(b[i + k] & 63)
+
+    char_from_u32(u).unwrap_or('\u{FFFD}')
+end char_at
+
+/** How many leading bytes `a` and `b` share, no more than `limit`, cut back to a whole character. */
+private shared_prefix(a: string, b: string, limit: usize) -> usize
+    var n: usize = 0
+    val most = min(limit, min(a.len, b.len))
+
+    while n < most && a.bytes[n] == b.bytes[n] do n += 1
+
+    while n > 0 && n < a.len && !boundary(a.bytes[n]) do n -= 1
+
+    n
+end shared_prefix
