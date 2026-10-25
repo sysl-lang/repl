@@ -19,7 +19,6 @@ trait Terminal
     read_byte(*self) -> Option[u8]
 
     /** Writes every byte, or answers `false`. */
-    @borrows(bytes)
     write(*self, bytes: []const u8) -> bool
 
     /** Pushes out anything held back. A terminal with no buffer answers `true` and does nothing. */
